@@ -1,12 +1,13 @@
 # INRFlash Task Monitor Bot — Dependencies
 # Install with: pip install -r requirements.txt
 
-# Telegram bot framework (job-queue extra includes APScheduler for scheduling)
-python-telegram-bot[job-queue]==20.7
+# Telegram bot framework — v22.7+ required for colored button (style=) support
+# (Bot API 9.4: InlineKeyboardButton style: primary/success/danger)
+python-telegram-bot[job-queue]>=22.7
 
 # HTTP requests
 requests==2.31.0
 
 # HTML parsing
 beautifulsoup4==4.12.3
-lxml==5.1.0
+#lxml==5.1.0
