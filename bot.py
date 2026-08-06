@@ -3,13 +3,16 @@
 INRFlash Task Monitor Bot  ⚡
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Monitors wallet.inrflash.com/offer_tasks.php for task changes.
+Also monitors offers.inrflash.com camp pages for offer availability.
 
 Features:
   • Account-based login  — stores mobile+password, auto-refreshes session
   • Multi-account pool   — rotate accounts when one session expires
   • User-agent rotation  — randomised UA pool, never sends same device twice in a row
   • Multi-user access    — owner can grant task-view access by Telegram ID
-  • Colorful buttons     — requires python-telegram-bot ≥ 22.7 (Bot API 9.4 style=)
+  • Camp Monitor         — monitors camp pages via fake/scrape phone tokens (same interval)
+  • Running Tasks        — tasks view shows wallet tasks + live camp monitor status
+  • Inline keyboards     — primary/success/danger style stripped for broad PTB compatibility
   • Futuristic UI        — blockquote, <code>, <b>, <s>, dividers, inline keyboards
 """
 
@@ -47,6 +50,14 @@ LOGIN_URL        = "https://wallet.inrflash.com/auth/login_api.php"
 BASE_URL         = "https://wallet.inrflash.com"
 JOB_NAME         = "inrflash_monitor"
 DEFAULT_INTERVAL = 1
+
+# ─── Camp Monitor  (offers.inrflash.com) ────────────────────
+CAMP_OFFERS_URL     = "https://offers.inrflash.com"
+CAMP_PHP_URL        = f"{CAMP_OFFERS_URL}/camp.php"
+CAMP_STATE_NODE     = "camp_monitor_state"
+OFFER_OVER_KEYWORDS = ["offer is over", "no slots available"]
+# Two fixed camp endpoints — monitored for every account mobile in the pool
+CAMP_NAMES          = ["Campinr4", "campinr"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FIREBASE REALTIME DATABASE  (replaces local tasks_state.json / bot_config.json)
@@ -215,6 +226,8 @@ _DEFAULTS: dict = {
     "active_account_index": 0,
     "accounts":             [],
     "users":                [],
+    # Camp monitor
+    "camp_monitoring":      True,   # uses existing accounts[] mobiles — no separate list
 }
 
 
@@ -255,6 +268,9 @@ runtime: dict = {
     "check_count":          0,
     "consecutive_failures": 0,
     "pending":              {},   # uid → pending context string
+    # Camp monitor
+    "camp_last_check":      None,
+    "camp_check_count":     0,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -301,6 +317,35 @@ def _fb_timestamp() -> str:
         return datetime.now().astimezone().isoformat()
     except Exception:
         return ""
+
+
+# ═══════════════════════════════════════════════════════════
+#  CAMP MONITOR STATE  (offers.inrflash.com)
+# ═══════════════════════════════════════════════════════════
+def load_camp_state() -> list:
+    """
+    Load camp monitor state from Firebase.
+    Returns list of:
+      { "key": "{phone}|{camp_lower}",
+        "phone": str, "label": str, "camp": str,
+        "token": str, "token_url": str,
+        "status": "offer_over"|"available"|"gone"|"error"|"unknown",
+        "last_text": str, "last_checked": str, "errors": int }
+    Each account mobile × 2 camp names = 2 entries per account.
+    """
+    data = firebase_get(CAMP_STATE_NODE)
+    if isinstance(data, dict):
+        return data.get("monitors", []) or []
+    return []
+
+
+def save_camp_state(monitors: list) -> None:
+    """Persist camp monitor state to Firebase."""
+    firebase_put(CAMP_STATE_NODE, {
+        "monitors":   monitors,
+        "updated_at": _fb_timestamp(),
+        "count":      len(monitors),
+    })
 
 
 # ═══════════════════════════════════════════════════════════
@@ -397,6 +442,31 @@ def _build_login_headers(phpsessid: str) -> dict:
         "sec-ch-ua":         ua["sec-ch-ua"],
         "sec-ch-ua-mobile":  ua["sec-ch-ua-mobile"],
         "sec-ch-ua-platform": ua["sec-ch-ua-platform"],
+    }
+    if ua["x-requested-with"]:
+        headers["x-requested-with"] = ua["x-requested-with"]
+    return headers
+
+
+def _build_camp_headers(host: str = "offers.inrflash.com") -> dict:
+    """Headers for requests to offers.inrflash.com — no auth cookie needed."""
+    ua = _pick_ua()
+    headers = {
+        "Host":                      host,
+        "upgrade-insecure-requests": "1",
+        "accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "dnt":                       "1",
+        "sec-fetch-site":            "none",
+        "sec-fetch-mode":            "navigate",
+        "sec-fetch-user":            "?1",
+        "sec-fetch-dest":            "document",
+        "accept-encoding":           "gzip, deflate, br, zstd",
+        "accept-language":           random.choice(_ACCEPT_LANG_POOL),
+        "priority":                  "u=0, i",
+        "user-agent":                ua["user-agent"],
+        "sec-ch-ua":                 ua["sec-ch-ua"],
+        "sec-ch-ua-mobile":          ua["sec-ch-ua-mobile"],
+        "sec-ch-ua-platform":        ua["sec-ch-ua-platform"],
     }
     if ua["x-requested-with"]:
         headers["x-requested-with"] = ua["x-requested-with"]
@@ -534,6 +604,97 @@ def auto_login_active() -> tuple[bool, str]:
 
 
 # ═══════════════════════════════════════════════════════════
+#  CAMP SCRAPER  (offers.inrflash.com)
+# ═══════════════════════════════════════════════════════════
+def fetch_camp_token(phone: str, camp: str = "campinr") -> tuple[Optional[str], Optional[str]]:
+    """
+    GET /camp.php?camp=<camp>&user=<phone>  →  302 to camp page with token.
+    Returns (token_string, full_token_url) or (None, None) on error.
+
+    Example:
+      GET /camp.php?camp=campinr&user=6370698981
+      302 Location: /campinr/?=T5ef465c4bc4c8e48d171c747b9b7a592
+    """
+    try:
+        url  = f"{CAMP_PHP_URL}?camp={camp}&user={phone}"
+        resp = requests.get(
+            url,
+            headers=_build_camp_headers(),
+            timeout=15,
+            allow_redirects=False,  # grab the 302 Location directly
+        )
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "").strip()
+            if location:
+                m = re.search(r"\?=([A-Za-z0-9]+)\s*$", location)
+                token    = m.group(1) if m else ""
+                full_url = location if location.startswith("http") else f"{CAMP_OFFERS_URL}{location}"
+                logger.info(f"Camp token [{phone}]: {token[:16] if token else 'no-token'} → {full_url}")
+                return token, full_url
+        logger.warning(f"Camp token [{phone}]: unexpected status {resp.status_code}")
+        return None, None
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Camp token [{phone}]: connection error.")
+        return None, None
+    except requests.exceptions.Timeout:
+        logger.error(f"Camp token [{phone}]: timed out.")
+        return None, None
+    except Exception as e:
+        logger.error(f"Camp token [{phone}]: {e}", exc_info=True)
+        return None, None
+
+
+def parse_camp_key_text(html: str) -> str:
+    """Extract visible text from camp page HTML (strips style/script, collapses whitespace)."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["style", "script", "meta", "head"]):
+            tag.decompose()
+        text = " ".join(soup.get_text(separator=" ", strip=True).split())
+        return text[:600]
+    except Exception:
+        return ""
+
+
+def classify_camp_status(key_text: str, http_status: Optional[int]) -> str:
+    """
+    "offer_over" → page loaded and contains 'offer is over' / 'no slots available'
+    "available"  → page loaded but those keywords are absent (offer may be live!)
+    "gone"       → non-200 HTTP response
+    "error"      → could not connect / timeout
+    """
+    if http_status is None:
+        return "error"
+    if http_status != 200:
+        return "gone"
+    lower = key_text.lower()
+    for kw in OFFER_OVER_KEYWORDS:
+        if kw in lower:
+            return "offer_over"
+    return "available"
+
+
+def fetch_camp_page(token_url: str) -> tuple[Optional[int], Optional[str]]:
+    """
+    GET the resolved camp page URL and return (http_status, key_text).
+    Returns (None, None) on network error.
+    """
+    try:
+        resp     = requests.get(token_url, headers=_build_camp_headers(), timeout=20)
+        key_text = parse_camp_key_text(resp.text)
+        return resp.status_code, key_text
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Camp page [{token_url}]: connection error.")
+        return None, None
+    except requests.exceptions.Timeout:
+        logger.error(f"Camp page [{token_url}]: timed out.")
+        return None, None
+    except Exception as e:
+        logger.error(f"Camp page [{token_url}]: {e}", exc_info=True)
+        return None, None
+
+
+# ═══════════════════════════════════════════════════════════
 #  SCRAPER
 # ═══════════════════════════════════════════════════════════
 def fetch_tasks() -> Optional[dict]:
@@ -654,21 +815,22 @@ def get_notify_ids() -> list:
 def main_menu_keyboard(for_owner: bool = True) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("📋  Tasks",       callback_data="btn_tasks",  style="primary"),
-            InlineKeyboardButton("📡  Status",      callback_data="btn_status", style="primary"),
+            InlineKeyboardButton("📋  Tasks",         callback_data="btn_tasks"),
+            InlineKeyboardButton("📡  Status",         callback_data="btn_status"),
         ],
         [
-            InlineKeyboardButton("🔍  Force Check", callback_data="btn_check",  style="success"),
+            InlineKeyboardButton("🏃  Running Tasks",  callback_data="btn_running_tasks"),
+            InlineKeyboardButton("🔍  Force Check",    callback_data="btn_check"),
         ],
     ]
     if for_owner:
         rows += [
             [
-                InlineKeyboardButton("⏸  Pause",    callback_data="btn_pause",  style="danger"),
-                InlineKeyboardButton("▶️  Resume",   callback_data="btn_resume", style="success"),
+                InlineKeyboardButton("⏸  Pause",     callback_data="btn_pause"),
+                InlineKeyboardButton("▶️  Resume",    callback_data="btn_resume"),
             ],
             [
-                InlineKeyboardButton("⚙️  Settings", callback_data="btn_settings", style="primary"),
+                InlineKeyboardButton("⚙️  Settings", callback_data="btn_settings"),
             ],
         ]
     return InlineKeyboardMarkup(rows)
@@ -676,60 +838,63 @@ def main_menu_keyboard(for_owner: bool = True) -> InlineKeyboardMarkup:
 
 def back_keyboard(dest: str = "btn_menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("← Back", callback_data=dest, style="primary"),
+        InlineKeyboardButton("← Back", callback_data=dest),
     ]])
 
 
 def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("👥  Users",     callback_data="btn_users",    style="primary"),
-            InlineKeyboardButton("🔐  Accounts",  callback_data="btn_accounts", style="primary"),
+            InlineKeyboardButton("👥  Users",        callback_data="btn_users"),
+            InlineKeyboardButton("🔐  Accounts",     callback_data="btn_accounts"),
         ],
         [
-            InlineKeyboardButton("⏱  Set Interval", callback_data="btn_setinterval_help", style="primary"),
+            InlineKeyboardButton("⏱  Set Interval", callback_data="btn_setinterval_help"),
         ],
-        [InlineKeyboardButton("← Back", callback_data="btn_menu", style="primary")],
+        [
+            InlineKeyboardButton("🏃  Camp Monitor", callback_data="btn_camp_settings"),
+        ],
+        [InlineKeyboardButton("← Back", callback_data="btn_menu")],
     ])
 
 
 def users_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕  Add User",    callback_data="btn_adduser",          style="success"),
-            InlineKeyboardButton("➖  Remove User", callback_data="btn_removeuser_list",  style="danger"),
+            InlineKeyboardButton("➕  Add User",    callback_data="btn_adduser"),
+            InlineKeyboardButton("➖  Remove User", callback_data="btn_removeuser_list"),
         ],
         [
-            InlineKeyboardButton("👁  View Users",  callback_data="btn_listusers",        style="primary"),
+            InlineKeyboardButton("👁  View Users",  callback_data="btn_listusers"),
         ],
-        [InlineKeyboardButton("← Back", callback_data="btn_settings", style="primary")],
+        [InlineKeyboardButton("← Back", callback_data="btn_settings")],
     ])
 
 
 def accounts_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕  Add Account",    callback_data="btn_addaccount",         style="success"),
-            InlineKeyboardButton("➖  Remove Account", callback_data="btn_removeaccount_list", style="danger"),
+            InlineKeyboardButton("➕  Add Account",    callback_data="btn_addaccount"),
+            InlineKeyboardButton("➖  Remove Account", callback_data="btn_removeaccount_list"),
         ],
         [
-            InlineKeyboardButton("🔄  Login All",      callback_data="btn_loginall",           style="success"),
-            InlineKeyboardButton("🔀  Switch Active",  callback_data="btn_switchaccount",      style="primary"),
+            InlineKeyboardButton("🔄  Login All",      callback_data="btn_loginall"),
+            InlineKeyboardButton("🔀  Switch Active",  callback_data="btn_switchaccount"),
         ],
         [
-            InlineKeyboardButton("📋  View Accounts",  callback_data="btn_listaccounts",       style="primary"),
+            InlineKeyboardButton("📋  View Accounts",  callback_data="btn_listaccounts"),
         ],
-        [InlineKeyboardButton("← Back", callback_data="btn_settings", style="primary")],
+        [InlineKeyboardButton("← Back", callback_data="btn_settings")],
     ])
 
 
 def check_result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔁  Check Again", callback_data="btn_check",  style="success"),
-            InlineKeyboardButton("📋  View Tasks",  callback_data="btn_tasks",  style="primary"),
+            InlineKeyboardButton("🔁  Check Again", callback_data="btn_check"),
+            InlineKeyboardButton("📋  View Tasks",  callback_data="btn_tasks"),
         ],
-        [InlineKeyboardButton("← Back", callback_data="btn_menu", style="primary")],
+        [InlineKeyboardButton("← Back", callback_data="btn_menu")],
     ])
 
 
@@ -741,9 +906,8 @@ def remove_user_keyboard() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             f"🗑 {label}  (ID: {u['id']})",
             callback_data=f"btn_removeuser_{u['id']}",
-            style="danger",
         )])
-    rows.append([InlineKeyboardButton("← Back", callback_data="btn_users", style="primary")])
+    rows.append([InlineKeyboardButton("← Back", callback_data="btn_users")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -755,9 +919,8 @@ def remove_account_keyboard() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             f"🗑 {st} {escape(a['label'])}",
             callback_data=f"btn_removeaccount_{i}",
-            style="danger",
         )])
-    rows.append([InlineKeyboardButton("← Back", callback_data="btn_accounts", style="primary")])
+    rows.append([InlineKeyboardButton("← Back", callback_data="btn_accounts")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -770,11 +933,32 @@ def switch_account_keyboard() -> InlineKeyboardMarkup:
         check = "✓ " if i == active else ""
         rows.append([InlineKeyboardButton(
             f"{check}{st} {escape(a['label'])}",
-            callback_data=f"btn_setactiveaccount_{i}",
-            style="success" if i == active else "primary",
+            callback_data=f"btn_setactiveaccount_{i}" if i == active else "primary",
         )])
-    rows.append([InlineKeyboardButton("← Back", callback_data="btn_accounts", style="primary")])
+    rows.append([InlineKeyboardButton("← Back", callback_data="btn_accounts")])
     return InlineKeyboardMarkup(rows)
+
+
+def camp_settings_keyboard() -> InlineKeyboardMarkup:
+    """
+    Camp monitor uses wallet accounts automatically — no add/remove needed.
+    Just shows status view and pause/resume toggle.
+    """
+    monitoring   = config.get("camp_monitoring", True)
+    toggle_label = "⏸  Pause Camp" if monitoring else "▶️  Resume Camp"
+    toggle_style = "danger" if monitoring else "success"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋  View Status", callback_data="btn_camp_listphones"),
+        ],
+        [
+            InlineKeyboardButton(toggle_label, callback_data="btn_camp_toggle"),
+        ],
+        [InlineKeyboardButton("← Back", callback_data="btn_settings")],
+    ])
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -800,16 +984,25 @@ def build_welcome_msg(for_owner: bool = True) -> str:
 
 
 def build_task_list(tasks: dict) -> str:
+    lines = []
     if not tasks:
-        return "<blockquote>⚠️ <b>No Tasks Available</b>\nThe list is currently empty.</blockquote>"
-    lines = [f"<blockquote>📋 <b>Active Tasks</b>  ·  <i>{_now()}</i></blockquote>\n", f"{_div()}\n"]
-    for i, (name, info) in enumerate(sorted(tasks.items()), 1):
-        link_part = f'\n   <a href="{escape(info["link"])}">▶️ Start Task</a>' if info.get("link", "#") != "#" else ""
-        lines.append(
-            f"<b>{i}.</b> {escape(name)}\n"
-            f"   💰 Reward: <code>{escape(info['reward'])}</code>{link_part}\n"
-        )
-    lines += [f"{_div()}", f"<i>📊 Total: <b>{len(tasks)}</b> task(s)</i>"]
+        lines.append("<blockquote>⚠️ <b>No Tasks Available</b>\nThe list is currently empty.</blockquote>")
+    else:
+        lines += [f"<blockquote>📋 <b>Active Tasks</b>  ·  <i>{_now()}</i></blockquote>\n", f"{_div()}\n"]
+        for i, (name, info) in enumerate(sorted(tasks.items()), 1):
+            link_part = f'\n   <a href="{escape(info["link"])}">▶️ Start Task</a>' if info.get("link", "#") != "#" else ""
+            lines.append(
+                f"<b>{i}.</b> {escape(name)}\n"
+                f"   💰 Reward: <code>{escape(info['reward'])}</code>{link_part}\n"
+            )
+        lines += [f"{_div()}", f"<i>📊 Total: <b>{len(tasks)}</b> task(s)</i>"]
+
+    # ── Running Tasks section (Camp Monitor) ────────────────
+    # Shows automatically whenever accounts are configured (no separate phone list needed)
+    if config.get("accounts"):
+        lines.append(f"\n{_div()}\n")
+        lines.append(_build_running_tasks_section())
+
     return "\n".join(lines)
 
 
@@ -828,9 +1021,16 @@ def build_status_msg() -> str:
             f"   Last login: <i>{last_lg}</i>"
         )
 
+    # Camp monitor stats
+    camp_monitoring = config.get("camp_monitoring", True)
+    accounts        = config.get("accounts", [])
+    c_icon          = "🟢" if camp_monitoring else "🔴"
+    c_label         = "Active ✓" if camp_monitoring else "Paused ✗"
+    camp_tasks      = len(accounts) * len(CAMP_NAMES)
+
     return (
         f"<blockquote>📡 <b>Monitor Dashboard</b>  ·  <i>{_now()}</i></blockquote>\n\n"
-        f"{_sec(icon, 'Monitoring')}\n"
+        f"{_sec(icon, 'Wallet Monitor')}\n"
         f"<blockquote>State       : <b>{label}</b>\n"
         f"Interval    : <code>{config['interval']} min</code>\n"
         f"Last Check  : <b>{runtime['last_check'] or 'Not yet'}</b>\n"
@@ -839,7 +1039,14 @@ def build_status_msg() -> str:
         f"Known Tasks : <b>{saved}</b></blockquote>\n\n"
         f"{_sec('🔐', 'Active Account')}\n"
         f"<blockquote>{ac_info}</blockquote>\n\n"
-        f"{_sec('🌐', 'Target')}\n<code>{TASK_URL}</code>"
+        f"{_sec('🌐', 'Wallet Target')}\n<code>{TASK_URL}</code>\n\n"
+        f"{_sec('🏃', 'Camp Monitor')}\n"
+        f"<blockquote>State       : {c_icon} <b>{c_label}</b>\n"
+        f"Accounts    : <b>{len(accounts)}</b>  ×  <b>{len(CAMP_NAMES)}</b> camps = <b>{camp_tasks}</b> tasks\n"
+        f"Camps       : <code>{'</code>, <code>'.join(CAMP_NAMES)}</code>\n"
+        f"Last Check  : <b>{runtime.get('camp_last_check') or 'Not yet'}</b>\n"
+        f"Checks      : <b>{runtime.get('camp_check_count', 0)}</b></blockquote>\n\n"
+        f"{_sec('🌐', 'Camp Target')}\n<code>{CAMP_PHP_URL}?camp=&lt;name&gt;&amp;user=&lt;mobile&gt;</code>"
     )
 
 
@@ -920,6 +1127,206 @@ def build_startup_msg(tasks: dict) -> str:
         f"Checking every <b>{config['interval']} min</b>.</blockquote>\n\n"
     )
     return header + build_task_list(tasks)
+
+
+# ═══════════════════════════════════════════════════════════
+#  CAMP MESSAGE BUILDERS
+# ═══════════════════════════════════════════════════════════
+_CAMP_STATUS_ICON  = {
+    "offer_over": "⚠️",
+    "available":  "🔥",
+    "gone":       "📴",
+    "error":      "❌",
+    "unknown":    "⏳",
+}
+_CAMP_STATUS_LABEL = {
+    "offer_over": "Offer is over",
+    "available":  "Available!",
+    "gone":       "Page gone",
+    "error":      "Fetch error",
+    "unknown":    "Not checked yet",
+}
+
+
+def _build_running_tasks_section() -> str:
+    """Compact section embedded inside build_task_list."""
+    accounts = config.get("accounts", [])
+    mon_st   = config.get("camp_monitoring", True)
+    mon_icon = "🟢" if mon_st else "🔴"
+    mon_map  = {m["key"]: m for m in load_camp_state()}
+
+    total    = len(accounts) * len(CAMP_NAMES)
+    lines    = [f"<blockquote>🏃 <b>Running Tasks</b>  ·  {mon_icon}  <i>{_now()}</i></blockquote>\n", f"{_div()}\n"]
+    idx      = 0
+    for acct in accounts:
+        phone = acct.get("mobile", "")
+        label = acct.get("label", phone)
+        if not phone:
+            continue
+        for camp in CAMP_NAMES:
+            idx   += 1
+            key    = f"{phone}|{camp.lower()}"
+            m      = mon_map.get(key, {})
+            st     = m.get("status", "unknown")
+            s_icon  = _CAMP_STATUS_ICON.get(st, "⏳")
+            s_label = _CAMP_STATUS_LABEL.get(st, "Unknown")
+            url     = m.get("token_url", "")
+            chk     = m.get("last_checked", "—")
+            url_part = f'\n   <a href="{escape(url)}">🔗 Camp Page</a>' if url and url != "#" else ""
+            lines.append(
+                f"<b>{idx}.</b> {escape(label)}  <code>{escape(phone)}</code>  |  camp: <code>{escape(camp)}</code>\n"
+                f"   {s_icon} <b>{s_label}</b>  ·  <i>{chk}</i>{url_part}\n"
+            )
+    lines += [f"{_div()}", f"<i>🏃 {total} camp task(s)  ·  Tap 🏃 Running Tasks for details</i>"]
+    return "\n".join(lines)
+
+
+def build_running_tasks_msg() -> str:
+    """
+    Full standalone running-tasks message.
+    Shows Campinr4 + campinr status for every wallet account mobile.
+    """
+    accounts = config.get("accounts", [])
+    mon_st   = config.get("camp_monitoring", True)
+    mon_lbl  = "Active ✓" if mon_st else "Paused ✗"
+    mon_ico  = "🟢" if mon_st else "🔴"
+    total    = len(accounts) * len(CAMP_NAMES)
+
+    if not accounts:
+        return (
+            f"<blockquote>🏃 <b>Running Tasks — Camp Monitor</b>\n"
+            f"State: {mon_ico} <b>{mon_lbl}</b></blockquote>\n\n"
+            f"<i>No wallet accounts configured yet.\n"
+            f"Add an account via Settings → 🔐 Accounts first.</i>"
+        )
+
+    mon_map = {m["key"]: m for m in load_camp_state()}
+    lines   = [
+        f"<blockquote>🏃 <b>Running Tasks — Camp Monitor</b>  ·  <i>{_now()}</i>\n"
+        f"State: {mon_ico} <b>{mon_lbl}</b>  |  Tasks: <b>{total}</b></blockquote>\n",
+        f"{_div()}\n"
+    ]
+    idx = 0
+    for acct in accounts:
+        phone = acct.get("mobile", "")
+        label = acct.get("label", phone)
+        if not phone:
+            continue
+        for camp in CAMP_NAMES:
+            idx    += 1
+            key     = f"{phone}|{camp.lower()}"
+            m       = mon_map.get(key, {})
+            st      = m.get("status", "unknown")
+            s_icon  = _CAMP_STATUS_ICON.get(st, "⏳")
+            s_label = _CAMP_STATUS_LABEL.get(st, "Unknown")
+            url     = m.get("token_url", "")
+            token   = m.get("token", "")
+            chk     = m.get("last_checked", "Never")
+            errors  = m.get("errors", 0)
+            tok_prev = f"<code>{token[:16]}…</code>" if token else "<i>No token yet</i>"
+            url_part = f'\n   <a href="{escape(url)}">🔗 Open Camp Page</a>' if url and url != "#" else ""
+            err_part = f"\n   ❗ Errors: <b>{errors}</b>" if errors else ""
+            lines.append(
+                f"<b>{idx}.</b> {escape(label)}\n"
+                f"   📱 <code>{escape(phone)}</code>  |  camp: <code>{escape(camp)}</code>\n"
+                f"   {s_icon} Status: <b>{s_label}</b>\n"
+                f"   🔑 Token: {tok_prev}\n"
+                f"   ⏱ Last Check: <i>{chk}</i>{err_part}{url_part}\n"
+            )
+    lines += [f"{_div()}", f"<i>📊 {idx} monitor(s)  ·  Interval: every <b>{config['interval']} min</b></i>"]
+    return "\n".join(lines)
+
+
+def build_camp_phones_list_msg() -> str:
+    """
+    Camp monitor settings view.
+    Shows status of both CAMP_NAMES for every wallet account.
+    """
+    accounts = config.get("accounts", [])
+    mon_st   = config.get("camp_monitoring", True)
+    mon_ico  = "🟢" if mon_st else "🔴"
+    mon_lbl  = "Active" if mon_st else "Paused"
+    mon_map  = {m["key"]: m for m in load_camp_state()}
+
+    lines = [
+        f"<blockquote>🏃 <b>Camp Monitor</b>  ·  {mon_ico} {mon_lbl}</blockquote>\n"
+        f"Monitoring <b>{len(CAMP_NAMES)} camp URLs</b> for each wallet account.\n",
+        _div()
+    ]
+    if not accounts:
+        lines.append("\n<i>No accounts configured yet.\nAdd one via Settings → 🔐 Accounts.</i>")
+    else:
+        idx = 0
+        for acct in accounts:
+            phone = acct.get("mobile", "")
+            label = acct.get("label", phone)
+            if not phone:
+                continue
+            acct_st   = "🟢" if acct.get("status") == "active" else ("🔴" if acct.get("status") == "expired" else "⚪")
+            lines.append(f"\n{acct_st} <b>{escape(label)}</b>  <code>{escape(phone)}</code>")
+            for camp in CAMP_NAMES:
+                idx    += 1
+                key     = f"{phone}|{camp.lower()}"
+                m       = mon_map.get(key, {})
+                st      = m.get("status", "unknown")
+                s_icon  = _CAMP_STATUS_ICON.get(st, "⏳")
+                s_label = _CAMP_STATUS_LABEL.get(st, "Unknown")
+                chk     = m.get("last_checked", "Never")
+                token   = m.get("token", "")
+                tok_prev = f"<code>{token[:12]}…</code>" if token else "<i>No token yet</i>"
+                lines.append(
+                    f"  <b>↳ {escape(camp)}</b>\n"
+                    f"     {s_icon} <b>{s_label}</b>\n"
+                    f"     🔑 {tok_prev}  ·  <i>{chk}</i>"
+                )
+    lines.append(f"\n{_div()}\n<i>Fresh token fetched per-account per-cycle via camp.php?camp=…&user=&lt;mobile&gt;</i>")
+    return "\n".join(lines)
+
+
+def build_camp_alert(changes: list) -> str:
+    """
+    Build the camp change notification matching the existing alert style.
+    changes: list of dicts:
+      { phone, label, old_status, new_status, key_text, token_url }
+    """
+    lines = [f"<blockquote>🔔 <b>Camp Monitor Alert</b>  ·  <i>{_now()}</i></blockquote>\n", f"{_div()}\n"]
+    for ch in changes:
+        old_st  = ch.get("old_status", "unknown")
+        new_st  = ch.get("new_status", "unknown")
+        url     = ch.get("token_url", "#")
+        label   = escape(ch.get("label", ch.get("phone", "?")))
+        phone   = escape(ch.get("phone", "?"))
+        txt_prv = escape(ch.get("key_text", "")[:120])
+        url_part = f'\n   <a href="{escape(url)}">🔗 Open Camp Page</a>' if url and url != "#" else ""
+
+        if new_st == "available":
+            lines.append(
+                f"<blockquote>🔥 <b>CAMP IS AVAILABLE!</b>\n"
+                f"   {label}  (<code>{phone}</code>)\n"
+                f"   <s>Offer is over</s> → <b>Offer may be LIVE now!</b>{url_part}</blockquote>"
+            )
+        elif new_st == "gone":
+            lines.append(
+                f"<blockquote>📴 <b>Camp Page Gone</b>\n"
+                f"   {label}  (<code>{phone}</code>)\n"
+                f"   Was: <i>{_CAMP_STATUS_LABEL.get(old_st, old_st)}</i>\n"
+                f"   Page is unreachable or returned an error.{url_part}</blockquote>"
+            )
+        elif new_st == "offer_over" and old_st in ("available", "gone"):
+            lines.append(
+                f"<blockquote>🔒 <b>Camp Closed Again</b>\n"
+                f"   {label}  (<code>{phone}</code>)\n"
+                f"   <s>{_CAMP_STATUS_LABEL.get(old_st, old_st)}</s> → <b>Offer is over</b>{url_part}</blockquote>"
+            )
+        else:
+            lines.append(
+                f"<blockquote>🔄 <b>Camp Status Changed</b>\n"
+                f"   {label}  (<code>{phone}</code>)\n"
+                f"   <s>{_CAMP_STATUS_LABEL.get(old_st, old_st)}</s> → <b>{_CAMP_STATUS_LABEL.get(new_st, new_st)}</b>\n"
+                f"   Preview: <i>{txt_prv}</i>{url_part}</blockquote>"
+            )
+    lines += [f"\n{_div()}", f"<i>📊 {len(changes)} camp monitor(s) triggered</i>"]
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1159,6 +1566,8 @@ async def _handle_pending_text(update: Update, context: ContextTypes.DEFAULT_TYP
                 "<blockquote>❌ Invalid — must be a whole number ≥ 1.</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
+
+    # ── Add camp phone ────────────────────────────────────
     else:
         runtime["pending"].pop(uid, None)
 
@@ -1193,6 +1602,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "btn_addaccount", "btn_removeaccount_list", "btn_loginall",
         "btn_switchaccount", "btn_listaccounts",
         "btn_setinterval_help",
+        # Camp monitor (uses wallet accounts — no add/remove needed)
+        "btn_camp_settings", "btn_camp_listphones", "btn_camp_toggle",
     }
     if data in _owner_only_buttons or data.startswith(
         ("btn_removeuser_", "btn_removeaccount_", "btn_setactiveaccount_")
@@ -1231,6 +1642,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 build_task_list(tasks), parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True, reply_markup=back_keyboard(),
             )
+
+    elif data == "btn_running_tasks":
+        await query.edit_message_text(
+            build_running_tasks_msg(), parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍  Force Camp Check", callback_data="btn_camp_forcecheck")],
+                [InlineKeyboardButton("← Back", callback_data="btn_menu")],
+            ]),
+        )
 
     elif data == "btn_status":
         await query.edit_message_text(
@@ -1290,7 +1711,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<code>123456789 My Friend</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Cancel", callback_data="btn_users", style="danger")
+                InlineKeyboardButton("✖ Cancel", callback_data="btn_users")
             ]]),
         )
 
@@ -1351,7 +1772,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "It auto re-logs in whenever the session expires — no more manual cookies!</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Cancel", callback_data="btn_accounts", style="danger")
+                InlineKeyboardButton("✖ Cancel", callback_data="btn_accounts")
             ]]),
         )
 
@@ -1447,8 +1868,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"<code>1</code>  <code>5</code>  <code>10</code>  <code>30</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Cancel", callback_data="btn_settings", style="danger")
+                InlineKeyboardButton("✖ Cancel", callback_data="btn_settings")
             ]]),
+        )
+
+    # ════════════════ CAMP MONITOR ════════════════════════
+
+    elif data == "btn_camp_settings":
+        await query.edit_message_text(
+            build_camp_phones_list_msg(), parse_mode=ParseMode.HTML,
+            reply_markup=camp_settings_keyboard(),
+        )
+
+    elif data == "btn_camp_listphones":
+        await query.edit_message_text(
+            build_camp_phones_list_msg(), parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard("btn_camp_settings"),
+        )
+
+    elif data == "btn_camp_toggle":
+        current = config.get("camp_monitoring", True)
+        config["camp_monitoring"] = not current
+        save_config(config)
+        new_state = "Resumed ▶️" if not current else "Paused ⏸"
+        await query.edit_message_text(
+            f"<blockquote>{'▶️' if not current else '⏸'} <b>Camp Monitor {new_state}</b>\n"
+            f"{'Monitoring is now active.' if not current else 'Camp checks are paused.'}</blockquote>",
+            parse_mode=ParseMode.HTML, reply_markup=back_keyboard("btn_camp_settings"),
+        )
+
+
+    elif data == "btn_camp_forcecheck":
+        await query.edit_message_text("🏃 <i>Running camp check…</i>", parse_mode=ParseMode.HTML)
+        await _do_camp_check(context.bot)
+        await query.edit_message_text(
+            build_running_tasks_msg(), parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍  Check Again", callback_data="btn_camp_forcecheck")],
+                [InlineKeyboardButton("← Back", callback_data="btn_menu")],
+            ]),
         )
 
 
@@ -1575,14 +2034,136 @@ async def _do_check(bot: Bot) -> Optional[bool]:
     return False
 
 
+async def _do_camp_check(bot: Bot) -> None:
+    """
+    One cycle of camp monitoring.
+    For each wallet account mobile, fetches tokens and checks BOTH camp URLs:
+      - offers.inrflash.com/camp.php?camp=Campinr4&user=<mobile>
+      - offers.inrflash.com/camp.php?camp=campinr&user=<mobile>
+    Notifies owner + added users on any status/text change.
+    Runs on the same interval as the wallet task monitor.
+    """
+    if not config.get("camp_monitoring", True):
+        logger.info("Camp monitor is paused — skipping.")
+        return
+
+    accounts = config.get("accounts", [])
+    if not accounts:
+        return
+
+    runtime["camp_check_count"] = runtime.get("camp_check_count", 0) + 1
+    runtime["camp_last_check"]  = _now()
+
+    # State keyed by "{phone}|{camp.lower()}"
+    saved     = load_camp_state()
+    state_map = {m["key"]: m for m in saved if "key" in m}
+
+    changes: list = []
+
+    for acct in accounts:
+        phone = acct.get("mobile", "")
+        label = acct.get("label", phone)
+        if not phone:
+            continue
+
+        for camp in CAMP_NAMES:
+            key         = f"{phone}|{camp.lower()}"
+            prev        = state_map.get(key, {})
+            prev_status = prev.get("status", "unknown")
+            prev_text   = prev.get("last_text", "")
+
+            # ── Step 1: fetch fresh token via camp.php ────────
+            token, token_url = fetch_camp_token(phone, camp)
+
+            if not token_url:
+                new_status = "error"
+                new_text   = ""
+                new_token  = prev.get("token", "")
+                new_url    = prev.get("token_url", "#")
+            else:
+                # ── Step 2: visit the resolved camp page ──────
+                http_code, key_text = fetch_camp_page(token_url)
+                new_text   = key_text or ""
+                new_status = classify_camp_status(new_text, http_code)
+                new_token  = token or prev.get("token", "")
+                new_url    = token_url
+
+            logger.info(f"Camp [{label}/{camp}]: {prev_status} → {new_status}")
+
+            # ── Detect changes (skip first run: unknown→anything) ──
+            if prev_status not in ("unknown",) and prev_status != new_status:
+                changes.append({
+                    "phone":      phone,
+                    "label":      label,
+                    "camp":       camp,
+                    "old_status": prev_status,
+                    "new_status": new_status,
+                    "key_text":   new_text,
+                    "token_url":  new_url,
+                })
+            elif prev_status == new_status == "offer_over" and prev_text and new_text and prev_text != new_text:
+                # Page text changed even though status is still offer_over — still alert
+                changes.append({
+                    "phone":      phone,
+                    "label":      label,
+                    "camp":       camp,
+                    "old_status": "offer_over",
+                    "new_status": "offer_over",
+                    "key_text":   new_text,
+                    "token_url":  new_url,
+                })
+
+            # ── Persist ───────────────────────────────────────
+            state_map[key] = {
+                "key":          key,
+                "phone":        phone,
+                "label":        label,
+                "camp":         camp,
+                "token":        new_token,
+                "token_url":    new_url,
+                "status":       new_status,
+                "last_text":    new_text or prev_text,
+                "last_checked": _now(),
+                "errors":       (prev.get("errors", 0) + 1) if new_status == "error" else 0,
+            }
+
+    save_camp_state(list(state_map.values()))
+
+    total_checked = len([a for a in accounts if a.get("mobile")]) * len(CAMP_NAMES)
+    if changes:
+        alert_text = build_camp_alert(changes)
+        for user_id in get_notify_ids():
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=alert_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=main_menu_keyboard(is_owner(user_id)),
+                )
+            except Exception as e:
+                logger.warning(f"Camp alert: could not notify {user_id}: {e}")
+        logger.info(f"Camp monitor: {len(changes)} change(s) in {total_checked} task(s).")
+    else:
+        logger.info(f"Camp monitor: no changes ({total_checked} task(s) checked).")
+
+
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs every interval — checks wallet tasks AND camp pages."""
     await _do_check(context.bot)
+    await _do_camp_check(context.bot)
 
 
 # ═══════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════
 def main() -> None:
+    # Python 3.12+ removed the implicit event-loop auto-creation.
+    # Python 3.14 raises RuntimeError on asyncio.get_event_loop() when no
+    # loop is set. Explicitly creating one before PTB touches asyncio fixes it.
+    import asyncio as _asyncio
+    _asyncio.set_event_loop(_asyncio.new_event_loop())
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",       start_cmd))
